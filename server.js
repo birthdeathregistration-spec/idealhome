@@ -30,7 +30,7 @@ const authDir = path.join(__dirname, 'auth_info_baileys');
 
 // Normalize Bangladesh phone number to WhatsApp JID
 function formatJid(phone) {
-  let num = String(phone).replace(/[^\d]/g, '');
+  let num = String(phone).split('@')[0].split(':')[0].replace(/[^\d]/g, '');
   if (num.startsWith('01') && num.length === 11) {
     num = '88' + num;
   } else if (num.startsWith('1') && num.length === 10) {
@@ -39,10 +39,17 @@ function formatJid(phone) {
   return num + '@s.whatsapp.net';
 }
 
-// Extract pure phone number from JID
+// Extract pure phone number from JID (handles multi-device :0, :1, and LID)
 function extractPhone(jid) {
   if (!jid) return '';
-  return jid.split('@')[0].replace(/[^\d]/g, '');
+  const base = jid.split('@')[0].split(':')[0];
+  let num = base.replace(/[^\d]/g, '');
+  if (num.startsWith('880') && num.length === 14) {
+    num = num.slice(0, 13);
+  } else if (num.startsWith('01') && num.length === 12) {
+    num = num.slice(0, 11);
+  }
+  return num;
 }
 
 // ===== CLOUD SESSION PERSISTENCE (Free Render Disk Wipe Protection) =====
@@ -188,12 +195,16 @@ async function startWhatsAppBot() {
       if (msg.key.remoteJid.includes('@g.us')) continue; // Ignore groups
 
       const senderJid = msg.key.remoteJid;
-      const senderPhone = extractPhone(senderJid);
+      // Handle WhatsApp LID privacy IDs if remoteJid is @lid
+      const actualJid = (senderJid && senderJid.includes('@lid'))
+        ? (msg.key.remoteJidAlt || msg.key.participant || msg.key.participantPn || senderJid)
+        : senderJid;
+      const senderPhone = extractPhone(actualJid);
       const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
 
       if (!text || text.trim() === '') continue;
 
-      console.log(`📩 Incoming message from ${senderPhone}: "${text}"`);
+      console.log(`📩 Incoming message from ${senderPhone} (${senderJid}): "${text}"`);
 
       // Forward to Google Apps Script Webhook
       try {

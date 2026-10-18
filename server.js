@@ -25,6 +25,8 @@ let currentQR = null;
 let isConnected = false;
 let botUser = null;
 let backupTimeout = null;
+let reconnectAttempts = 0;
+let isStarting = false;
 
 const authDir = path.join(__dirname, 'auth_info_baileys');
 
@@ -129,111 +131,141 @@ async function clearCloudAuth() {
 
 // ===== Initialize WhatsApp Baileys Engine =====
 async function startWhatsAppBot() {
-  if (!fs.existsSync(authDir)) {
-    fs.mkdirSync(authDir, { recursive: true });
-  }
+  if (isStarting) return;
+  isStarting = true;
 
-  // Restore session from Google Sheets if authDir is empty (Render free container restart)
-  await syncAuthFromCloud();
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
-
-  sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: true,
-    browser: ['Ideal Home Mess', 'Chrome', '120.0.0']
-  });
-
-  sock.ev.on('creds.update', async () => {
-    await saveCreds();
-    scheduleCloudBackup();
-  });
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      currentQR = await QRCode.toDataURL(qr);
-      isConnected = false;
-      console.log('⚡ New QR code generated. Visit Web Dashboard to scan.');
-    }
-
-    if (connection === 'open') {
-      isConnected = true;
-      currentQR = null;
-      botUser = sock.user;
-      console.log('✅ WhatsApp connected successfully as:', botUser?.id || botUser?.name);
-      scheduleCloudBackup(1000);
-    }
-
-    if (connection === 'close') {
-      isConnected = false;
-      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('⚠️ Connection closed due to:', lastDisconnect?.error?.message || lastDisconnect?.error, 'Reconnecting:', shouldReconnect);
-      if (shouldReconnect) {
-        setTimeout(startWhatsAppBot, 3000);
-      } else {
-        console.log('❌ Logged out. Clearing session and regenerating QR...');
-        await clearCloudAuth();
-        try {
-          fs.rmSync(authDir, { recursive: true, force: true });
-        } catch (e) {}
-        setTimeout(startWhatsAppBot, 2000);
-      }
-    }
-  });
-
-  // Handle Incoming WhatsApp Messages from Boarders
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue; // Ignore bot's own messages
-      if (msg.key.remoteJid.includes('@g.us')) continue; // Ignore groups
-
-      const senderJid = msg.key.remoteJid;
-      // Handle WhatsApp LID privacy IDs if remoteJid is @lid
-      const actualJid = (senderJid && senderJid.includes('@lid'))
-        ? (msg.key.remoteJidAlt || msg.key.participant || msg.key.participantPn || senderJid)
-        : senderJid;
-      const senderPhone = extractPhone(actualJid);
-      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-
-      if (!text || text.trim() === '') continue;
-
-      console.log(`📩 Incoming message from ${senderPhone} (${senderJid}): "${text}"`);
-
-      // Forward to Google Apps Script Webhook
+  try {
+    // 1. Clean up old socket cleanly before starting new connection
+    if (sock) {
       try {
-        const fetchRes = await fetch(SCRIPT_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'WHATSAPP_BOT',
-            sender: senderPhone,
-            message: text,
-            sendReply: false
-          })
-        });
-
-        const data = await fetchRes.json();
-        if (data && data.reply) {
-          console.log(`📤 Sending reply to ${senderPhone}: "${data.reply}"`);
-          await sock.sendMessage(senderJid, { text: data.reply });
-        }
-      } catch (err) {
-        console.error('❌ Error forwarding to Google Apps Script:', err.message);
-      }
+        sock.ev.removeAllListeners();
+        if (sock.ws) sock.ws.close();
+      } catch (e) {}
+      sock = null;
     }
-  });
+
+    if (!fs.existsSync(authDir)) {
+      fs.mkdirSync(authDir, { recursive: true });
+    }
+
+    // 2. Restore session from Google Sheets if disk is empty
+    await syncAuthFromCloud();
+
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
+
+    sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: 'silent' }),
+      browser: ['Ideal Home Mess', 'Chrome', '120.0.0'],
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 0,
+      keepAliveIntervalMs: 25000,
+      syncFullHistory: false
+    });
+
+    sock.ev.on('creds.update', async () => {
+      await saveCreds();
+      scheduleCloudBackup();
+    });
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        currentQR = await QRCode.toDataURL(qr);
+        isConnected = false;
+        console.log('⚡ New QR code generated. Visit Web Dashboard to scan.');
+      }
+
+      if (connection === 'open') {
+        reconnectAttempts = 0;
+        isConnected = true;
+        currentQR = null;
+        botUser = sock.user;
+        console.log('✅ WhatsApp connected successfully as:', botUser?.id || botUser?.name);
+        scheduleCloudBackup(1000);
+      }
+
+      if (connection === 'close') {
+        isConnected = false;
+        const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+        console.log('⚠️ Connection closed due to:', lastDisconnect?.error?.message || lastDisconnect?.error, 'Status Code:', statusCode);
+
+        // If explicitly logged out OR if connection fails 4 times in a row (corrupted/stale session):
+        reconnectAttempts++;
+        if (isLoggedOut || reconnectAttempts >= 4) {
+          console.log(`❌ ${isLoggedOut ? 'Logged out from device' : 'Reconnection failed 4 times'}. Clearing stale session to generate fresh QR...`);
+          reconnectAttempts = 0;
+          await clearCloudAuth();
+          try {
+            fs.rmSync(authDir, { recursive: true, force: true });
+          } catch (e) {}
+          setTimeout(startWhatsAppBot, 2000);
+        } else {
+          const delay = Math.min(reconnectAttempts * 3000, 12000);
+          console.log(`⏳ Reconnecting in ${delay / 1000}s (Attempt ${reconnectAttempts}/4)...`);
+          setTimeout(startWhatsAppBot, delay);
+        }
+      }
+    });
+
+    // Handle Incoming WhatsApp Messages from Boarders
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+
+      for (const msg of messages) {
+        if (msg.key.fromMe) continue; // Ignore bot's own messages
+        if (msg.key.remoteJid.includes('@g.us')) continue; // Ignore groups
+
+        const rawJid = msg.key.remoteJid;
+        // Handle WhatsApp LID privacy IDs if remoteJid is @lid
+        const actualJid = (rawJid && rawJid.includes('@lid'))
+          ? (msg.key.remoteJidAlt || msg.key.participant || msg.key.participantPn || rawJid)
+          : rawJid;
+        const senderPhone = extractPhone(actualJid);
+        const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+
+        if (!text || text.trim() === '') continue;
+
+        console.log(`📩 Incoming message from ${senderPhone} (${rawJid}): "${text}"`);
+
+        // Forward to Google Apps Script Webhook
+        try {
+          const fetchRes = await fetch(SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'WHATSAPP_BOT',
+              sender: senderPhone,
+              message: text,
+              sendReply: false
+            })
+          });
+
+          const data = await fetchRes.json();
+          if (data && data.reply) {
+            console.log(`📤 Sending reply to ${senderPhone}: "${data.reply}"`);
+            await sock.sendMessage(rawJid, { text: data.reply });
+          }
+        } catch (err) {
+          console.error('❌ Error forwarding to Google Apps Script:', err.message);
+        }
+      }
+    });
+  } catch (err) {
+    console.error('❌ Error starting WhatsApp Bot:', err.message);
+    setTimeout(startWhatsAppBot, 5000);
+  } finally {
+    isStarting = false;
+  }
 }
 
 // ===== API ROUTES =====
 
-// 1. Web Dashboard (QR Code and Live Connection Status)
+// 1. Web Dashboard (QR Code, Status, and Reset Button)
 app.get('/', (req, res) => {
   const html = `
   <!DOCTYPE html>
@@ -282,17 +314,21 @@ app.get('/', (req, res) => {
         }
       </div>
 
-      <div class="bg-slate-50 p-3.5 rounded-2xl border text-left text-xs text-slate-600 space-y-1.5 mb-4">
-        <p class="font-bold text-slate-700 flex items-center gap-1.5"><i class="fas fa-shield-alt text-green-600"></i> সুবিধা ও নিরাপত্তা:</p>
-        <p>• কোনো থার্ড পার্টি নেই, ১০০% আপনার নিয়ন্ত্রণে ও ফ্রি।</p>
-        <p>• শুধুমাত্র গুগল শিটে নিবন্ধিত বর্ডারদের মেসেজ পাঠাবে।</p>
-        <p>• ২৪ ঘণ্টার কোনো সীমাবদ্ধতা নেই, আনলিমিটেড ফ্রি মেসেজ।</p>
-        <p>• ক্লাউড সেশন সিঙ্ক থাকায় রিস্টার্ট হলেও পুনরায় স্ক্যান করতে হবে না।</p>
+      <div class="bg-slate-50 p-3.5 rounded-2xl border text-left text-xs text-slate-600 space-y-1.5 mb-5">
+        <p class="font-bold text-slate-700 flex items-center gap-1.5"><i class="fas fa-shield-alt text-green-600"></i> নিরাপত্তা ও সুরক্ষা:</p>
+        <p>• প্রতিটি মেসেজের মাঝে ৫-৬ সেকেন্ড নিরাপদ বিরতি থাকে।</p>
+        <p>• অ্যাকাউন্ট ব্যান হওয়ার কোনো ঝুঁকি নেই।</p>
+        <p>• শুধুমাত্র গুগল শিটে নিবন্ধিত বর্ডারদের মেসেজ পাঠানো হয়।</p>
       </div>
 
-      <button onclick="location.reload()" class="w-full bg-slate-800 hover:bg-slate-900 text-white py-2.5 rounded-xl font-bold text-xs shadow active:scale-95 transition">
-        <i class="fas fa-sync-alt mr-1"></i> রিফ্রেশ করুন
-      </button>
+      <div class="flex gap-2">
+        <button onclick="location.reload()" class="flex-1 bg-slate-800 hover:bg-slate-900 text-white py-2.5 rounded-xl font-bold text-xs shadow active:scale-95 transition">
+          <i class="fas fa-sync-alt mr-1"></i> রিফ্রেশ করুন
+        </button>
+        <a href="/reset" onclick="return confirm('আপনি কি নিশ্চিত যে সেশন রিসেট করে নতুন QR কোড তৈরি করতে চান?')" class="flex-1 bg-rose-600 hover:bg-rose-700 text-white py-2.5 rounded-xl font-bold text-xs shadow active:scale-95 transition flex items-center justify-center gap-1">
+          <i class="fas fa-trash-alt mr-1"></i> সেশন রিসেট (নতুন QR)
+        </a>
+      </div>
     </div>
   </body>
   </html>
@@ -300,7 +336,52 @@ app.get('/', (req, res) => {
   res.send(html);
 });
 
-// 2. Health & Status Check Endpoint
+// 2. Reset Session & Force Fresh QR Code
+app.get('/reset', async (req, res) => {
+  try {
+    if (sock) {
+      try {
+        sock.ev.removeAllListeners();
+        if (sock.ws) sock.ws.close();
+      } catch (e) {}
+      sock = null;
+    }
+    isConnected = false;
+    currentQR = null;
+    botUser = null;
+    reconnectAttempts = 0;
+    await clearCloudAuth();
+    try {
+      fs.rmSync(authDir, { recursive: true, force: true });
+    } catch (e) {}
+    setTimeout(startWhatsAppBot, 1000);
+
+    res.send(`
+      <!DOCTYPE html>
+      <html lang="bn">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Resetting Session</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+      </head>
+      <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
+        <div class="bg-white rounded-3xl p-8 max-w-sm w-full text-center shadow-xl">
+          <div class="w-12 h-12 bg-green-100 text-green-600 rounded-full flex items-center justify-center text-xl mx-auto mb-3">✓</div>
+          <h2 class="text-base font-bold text-slate-800">সেশন রিসেট সফল হয়েছে!</h2>
+          <p class="text-xs text-slate-500 mt-1 mb-4">নতুন QR কোড তৈরি হচ্ছে, অপেক্ষা করুন...</p>
+          <div class="animate-spin w-6 h-6 border-2 border-green-600 border-t-transparent rounded-full mx-auto"></div>
+        </div>
+        <script>setTimeout(() => { window.location.href = '/'; }, 3000);</script>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    res.status(500).send('Reset failed: ' + err.message);
+  }
+});
+
+// 3. Health & Status Check Endpoint
 app.get('/status', (req, res) => {
   res.json({
     connected: isConnected,
@@ -310,12 +391,12 @@ app.get('/status', (req, res) => {
   });
 });
 
-// 3. Keep-Alive Ping Endpoint (for Google Apps Script / UptimeRobot)
+// 4. Keep-Alive Ping Endpoint (for Google Apps Script / UptimeRobot)
 app.get('/ping', (req, res) => {
   res.send('pong ' + new Date().toISOString());
 });
 
-// 4. Send Single Message API (Called by Google Apps Script)
+// 5. Send Single Message API (Called by Google Apps Script)
 app.post('/send', async (req, res) => {
   const { phone, message } = req.body;
 
@@ -338,7 +419,7 @@ app.post('/send', async (req, res) => {
   }
 });
 
-// 5. Broadcast Endpoint (Batch sending with safe 5-6 second delay to prevent WhatsApp ban)
+// 6. Broadcast Endpoint (Batch sending with safe 5-6 second delay to prevent WhatsApp ban)
 app.post('/broadcast', async (req, res) => {
   const { messages } = req.body;
 

@@ -338,7 +338,7 @@ app.post('/send', async (req, res) => {
   }
 });
 
-// 5. Broadcast Endpoint (Batch sending with safe 1.5s delay)
+// 5. Broadcast Endpoint (Batch sending with safe 5-6 second delay to prevent WhatsApp ban)
 app.post('/broadcast', async (req, res) => {
   const { messages } = req.body;
 
@@ -350,19 +350,29 @@ app.post('/broadcast', async (req, res) => {
     return res.status(400).json({ status: 'error', message: 'messages array is required.' });
   }
 
-  res.json({ status: 'processing', message: `Queued ${messages.length} messages for sending.` });
+  res.json({ status: 'processing', message: `Queued ${messages.length} messages. Sending safely with 5-6s delay.` });
 
   (async () => {
-    for (const item of messages) {
+    console.log(`📢 Starting safe broadcast of ${messages.length} messages (5-6s interval)...`);
+    for (let i = 0; i < messages.length; i++) {
+      const item = messages[i];
       if (!item.phone || !item.message) continue;
       try {
         const jid = formatJid(item.phone);
         await sock.sendMessage(jid, { text: item.message });
-        await new Promise((r) => setTimeout(r, 1500)); // 1.5s safe delay to prevent anti-spam trigger
+        console.log(`✅ [${i + 1}/${messages.length}] Sent message to ${item.phone}`);
+
+        // 5 to 6.5 seconds human-like delay between messages to prevent WhatsApp anti-spam ban
+        if (i < messages.length - 1) {
+          const delayMs = 5000 + Math.floor(Math.random() * 1500); // 5000ms - 6500ms (5 to 6.5s)
+          console.log(`⏳ Waiting ${(delayMs / 1000).toFixed(1)}s before sending next message...`);
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
       } catch (e) {
-        console.error(`Error broadcasting to ${item.phone}:`, e.message);
+        console.error(`❌ Error broadcasting to ${item.phone}:`, e.message);
       }
     }
+    console.log(`🎉 Safe broadcast completed for all ${messages.length} boarders.`);
   })();
 });
 

@@ -7,6 +7,6 @@ services:
     startCommand: node server.js
     envVars:
       - key: GOOGLE_SCRIPT_URL
-        value: https://script.google.com/macros/s/AKfycbw6IdTXV95MJUMjTp3ZyDDIHASz9zOIlQ6fgkrxWFru1h5TZKYsHmSgRbc0KV090w9SCg/exec
+        value: https://script.google.com/macros/s/AKfycbxtiCFzakfFunCMZQw6DavC-fESmLj0c36rdrLigwRCeDvwXPiTgIIGwynQZSL9V9UT/exec
       - key: NODE_VERSION
         value: 20.10.0

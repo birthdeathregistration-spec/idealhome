@@ -187,7 +187,7 @@ async function startWhatsAppBot() {
       version,
       auth: state,
       logger: pino({ level: 'silent' }),
-      browser: ['Ideal Home Mess', 'Chrome', '120.0.0'],
+      browser: ['Ubuntu', 'Chrome', '20.0.04'],
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 0,
       keepAliveIntervalMs: 25000,
@@ -273,10 +273,26 @@ async function startWhatsAppBot() {
         }
 
         // Handle WhatsApp LID privacy IDs if remoteJid is @lid
-        const actualJid = (rawJid && rawJid.includes('@lid'))
-          ? (msg.key.remoteJidAlt || msg.key.participant || msg.key.participantPn || rawJid)
-          : rawJid;
-        const senderPhone = extractPhone(actualJid) || (isSelfChat ? botPhone : '');
+        let resolvedPhone = '';
+        if (rawJid.endsWith('@s.whatsapp.net')) {
+          resolvedPhone = extractPhone(rawJid);
+        } else {
+          if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.endsWith('@s.whatsapp.net')) {
+            resolvedPhone = extractPhone(msg.key.remoteJidAlt);
+          } else if (msg.key.participantPn && msg.key.participantPn.endsWith('@s.whatsapp.net')) {
+            resolvedPhone = extractPhone(msg.key.participantPn);
+          } else if (msg.key.senderPn && msg.key.senderPn.endsWith('@s.whatsapp.net')) {
+            resolvedPhone = extractPhone(msg.key.senderPn);
+          }
+          if (!resolvedPhone && sock.signalRepository?.lidMapping?.getPNForLID) {
+            try {
+              const pn = await sock.signalRepository.lidMapping.getPNForLID(rawJid);
+              if (pn) resolvedPhone = extractPhone(pn);
+            } catch (e) {}
+          }
+        }
+
+        const senderPhone = resolvedPhone || (isSelfChat ? botPhone : extractPhone(rawJid));
 
         logEvent('📩', `Incoming from ${senderPhone || rawJid}: "${text.slice(0, 60)}"`);
 
@@ -288,6 +304,8 @@ async function startWhatsAppBot() {
             body: JSON.stringify({
               action: 'WHATSAPP_BOT',
               sender: senderPhone,
+              senderJid: rawJid,
+              jid: rawJid,
               message: text,
               sendReply: false
             })
@@ -295,14 +313,13 @@ async function startWhatsAppBot() {
 
           const data = await fetchRes.json();
           if (data && data.reply) {
-            logEvent('📤', `Sending reply to ${senderPhone || rawJid}: "${data.reply.slice(0, 45)}..."`);
-            const replyJid = (rawJid && rawJid.includes('@s.whatsapp.net')) 
-              ? rawJid 
-              : (senderPhone ? formatJid(senderPhone) : rawJid);
+            logEvent('📤', `Sending reply to ${rawJid}: "${data.reply.slice(0, 45)}..."`);
+            // THE CRITICAL FIX: Replying to an incoming chat MUST always go directly to rawJid (msg.key.remoteJid)!
+            const replyJid = rawJid;
             await sock.sendMessage(replyJid, { text: data.reply });
-            logEvent('✅', `Delivered reply to ${senderPhone || rawJid}`);
+            logEvent('✅', `Delivered reply to ${rawJid} (${senderPhone || 'LID'})`);
           } else {
-            logEvent('⚠️', `GAS Webhook did not return a reply for ${senderPhone}`);
+            logEvent('⚠️', `GAS Webhook did not return a reply for ${senderPhone || rawJid}`);
           }
         } catch (err) {
           logEvent('❌', `Error forwarding to Google Apps Script: ${err.message}`);
@@ -463,6 +480,39 @@ app.get('/status', (req, res) => {
   });
 });
 
+// 3.1 8-Digit Pairing Code Endpoint (Link without QR camera scan)
+app.get('/pair', async (req, res) => {
+  try {
+    const phone = req.query.phone;
+    if (!phone) {
+      return res.status(400).json({ status: 'error', message: 'মোবাইল নম্বর প্রদান করুন (যেমন: 01712345678)' });
+    }
+    if (isConnected) {
+      return res.json({ status: 'connected', message: 'WhatsApp ইতিমধ্যে সংযুক্ত রয়েছে।' });
+    }
+    if (!sock) {
+      return res.status(503).json({ status: 'error', message: 'বট ইঞ্জিন চালু হচ্ছে, অনুগ্রহ করে ৫ সেকেন্ড পর চেষ্টা করুন...' });
+    }
+
+    let clean = String(phone).replace(/[^\d]/g, '');
+    if (clean.startsWith('01') && clean.length === 11) clean = '88' + clean;
+    else if (clean.startsWith('1') && clean.length === 10) clean = '880' + clean;
+
+    const code = await sock.requestPairingCode(clean);
+    logEvent('🔑', `Generated 8-digit Pairing Code for ${clean}: ${code}`);
+    return res.json({
+      status: 'success',
+      code: code,
+      phone: clean,
+      message: 'পেয়ারিং কোড সফলভাবে তৈরি হয়েছে।'
+    });
+  } catch (err) {
+    console.error('Pairing code error:', err);
+    logEvent('❌', `Pairing code error: ${err.message}`);
+    return res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 // 4. Live Logs Endpoint
 app.get('/logs', (req, res) => {
   res.json({ count: logBuffer.length, logs: logBuffer });
@@ -473,7 +523,16 @@ app.get('/ping', (req, res) => {
   res.send('pong ' + new Date().toISOString());
 });
 
-// 6. Send Single Message API (Called by Google Apps Script)
+// Smart Anti-Duplicate Cache (Prevents double dispatch within 10s)
+const recentSentLog = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - 20000;
+  for (const [k, t] of recentSentLog.entries()) {
+    if (t < cutoff) recentSentLog.delete(k);
+  }
+}, 30000);
+
+// 6. Send Single Message API (Called by Google Apps Script & Frontend)
 app.post('/send', async (req, res) => {
   const { phone, message } = req.body;
 
@@ -486,8 +545,16 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ status: 'error', message: 'phone and message are required.' });
   }
 
+  const cleanPhone = String(phone).replace(/\D/g, '');
+  const dedupKey = cleanPhone + '_' + String(message).slice(0, 40);
+  if (recentSentLog.has(dedupKey) && (Date.now() - recentSentLog.get(dedupKey) < 10000)) {
+    logEvent('ℹ️', `Duplicate suppressed for ${cleanPhone}`);
+    return res.json({ status: 'success', message: 'Message already delivered (deduplicated).' });
+  }
+  recentSentLog.set(dedupKey, Date.now());
+
   try {
-    const jid = formatJid(phone);
+    const jid = (typeof phone === 'string' && phone.includes('@')) ? phone : formatJid(phone);
     await sock.sendMessage(jid, { text: message });
     logEvent('📤', `Single message delivered to ${phone}`);
     res.json({ status: 'success', message: 'Message sent successfully.' });

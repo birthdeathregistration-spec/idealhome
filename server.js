@@ -17,7 +17,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || "https://script.google.com/macros/s/AKfycbw6IdTXV95MJUMjTp3ZyDDIHASz9zOIlQ6fgkrxWFru1h5TZKYsHmSgRbc0KV090w9SCg/exec";
+const SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || "https://script.google.com/macros/s/AKfycbxtiCFzakfFunCMZQw6DavC-fESmLj0c36rdrLigwRCeDvwXPiTgIIGwynQZSL9V9UT/exec";
 
 // Global Bot State
 let sock = null;
